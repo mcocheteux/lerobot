@@ -19,12 +19,17 @@ Centralises all :mod:`av` introspection of the bundled FFmpeg build.
 Checks degrade to a no-op when the target codec isn't available locally.
 """
 
+import ctypes
 import functools
 import logging
+import sys
+from pathlib import Path
 from typing import Any
 
 import av
 import numpy as np
+
+from lerobot.configs.video import parse_svtav1_version, svtav1_version_from_library_name
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +90,118 @@ def _get_codec_video_formats(vcodec: str) -> tuple[str, ...]:
     if codec is None:
         return ()
     return tuple(fmt.name for fmt in (codec.video_formats or []))
+
+
+def _library_name_is_svtav1(path: str) -> bool:
+    return "svtav1" in Path(path).name.lower()
+
+
+def _unique_paths(paths: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _loaded_svtav1_library_paths() -> list[str]:
+    """Paths of SVT-AV1 libraries already mapped into this process."""
+    if sys.platform == "darwin":
+        try:
+            dyld = ctypes.CDLL(None)
+            count = int(dyld._dyld_image_count())
+            get_name = dyld._dyld_get_image_name
+            get_name.restype = ctypes.c_char_p
+            get_name.argtypes = (ctypes.c_uint32,)
+        except (AttributeError, OSError):
+            logger.debug("dyld image list is unavailable", exc_info=True)
+            return []
+        paths: list[str] = []
+        for index in range(count):
+            raw = get_name(index)
+            if not raw:
+                continue
+            path = raw.decode("utf-8", "replace")
+            if _library_name_is_svtav1(path):
+                paths.append(path)
+        return paths
+
+    if sys.platform.startswith("linux"):
+        try:
+            text = Path("/proc/self/maps").read_text(errors="replace")
+        except OSError:
+            return []
+        paths = []
+        for line in text.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            path = parts[-1]
+            if path.startswith("/") and _library_name_is_svtav1(path):
+                paths.append(path)
+        return paths
+    return []
+
+
+def _packaged_svtav1_library_paths() -> list[str]:
+    """SVT-AV1 libraries shipped next to the installed PyAV package."""
+    package_dir = Path(av.__file__).resolve().parent
+    roots = (package_dir, package_dir / ".dylibs", package_dir.parent / "av.libs")
+    found: list[str] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            candidates = root.rglob("libSvtAv1Enc*")
+        except OSError:
+            continue
+        found.extend(str(path) for path in candidates if path.is_file())
+    return found
+
+
+def _svtav1_version_from_symbol(lib_path: str | None) -> tuple[int, int, int] | None:
+    """Call ``svt_av1_get_version`` without opening an encoder.
+
+    Opening and closing ``libsvtav1`` is the macOS crash. The version symbol
+    only returns a compile-time string.
+    """
+    try:
+        lib = ctypes.CDLL(None) if lib_path is None else ctypes.CDLL(lib_path)
+        version_fn = lib.svt_av1_get_version
+        version_fn.restype = ctypes.c_char_p
+        version_fn.argtypes = []
+        raw = version_fn()
+    except (AttributeError, OSError, ValueError):
+        logger.debug("svt_av1_get_version is unavailable for %s", lib_path, exc_info=True)
+        return None
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    return parse_svtav1_version(text)
+
+
+@functools.cache
+def bundled_svtav1_version() -> tuple[int, int, int] | None:
+    """Return the SVT-AV1 version linked by ``libsvtav1``, or ``None``.
+
+    Does not open an encoder. The macOS abort happens when one is destroyed.
+    """
+    if get_codec("libsvtav1") is None:
+        return None
+    # Only libraries already mapped for this FFmpeg, or shipped beside PyAV.
+    # ctypes.util.find_library can return a different system SVT-AV1 than the one the encoder uses.
+    paths = _unique_paths(_loaded_svtav1_library_paths() + _packaged_svtav1_library_paths())
+    for path in paths:
+        version = svtav1_version_from_library_name(path)
+        if version is not None:
+            return version
+        version = _svtav1_version_from_symbol(path)
+        if version is not None:
+            return version
+    return _svtav1_version_from_symbol(None)
 
 
 def detect_available_encoders_pyav(encoders: list[str] | str) -> list[str]:

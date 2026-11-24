@@ -29,9 +29,10 @@ pytest.importorskip("av", reason="av is required (install lerobot[dataset])")
 import av  # noqa: E402
 
 from lerobot.configs import VALID_VIDEO_CODECS, DepthEncoderConfig, RGBEncoderConfig, VideoEncoderConfig
+from lerobot.configs.video import macos_svtav1_close_is_unsafe
 from lerobot.datasets.image_writer import write_image
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.pyav_utils import get_codec
+from lerobot.datasets.pyav_utils import bundled_svtav1_version, get_codec
 from lerobot.datasets.utils import INFO_PATH
 from lerobot.datasets.video_utils import (
     concatenate_video_files,
@@ -380,6 +381,45 @@ class TestEncoderDetection:
         assert "auto" in VALID_VIDEO_CODECS
         assert "h264_videotoolbox" in VALID_VIDEO_CODECS
         assert "h264_nvenc" in VALID_VIDEO_CODECS
+
+
+class TestMacOSSVTAV1Fallback:
+    @require_libsvtav1
+    def test_bundled_svtav1_version_is_readable(self):
+        version = bundled_svtav1_version()
+        assert version is not None
+        assert version >= (1, 0, 0)
+
+    @require_h264
+    @require_libsvtav1
+    def test_affected_wheel_falls_back_to_h264_on_darwin(self, monkeypatch):
+        monkeypatch.setattr("lerobot.configs.video._macos_svtav1_warned", False)
+        version = bundled_svtav1_version()
+        if not macos_svtav1_close_is_unsafe(version):
+            pytest.skip(f"bundled SVT-AV1 {version} is not a known-affected build")
+        monkeypatch.setattr("lerobot.configs.video.platform.system", lambda: "Darwin")
+        cfg = RGBEncoderConfig(preset=12)
+        assert cfg.vcodec == "h264"
+        assert cfg.preset is None
+
+    @require_h264
+    def test_affected_darwin_default_encodes_h264(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("lerobot.configs.video._macos_svtav1_warned", False)
+        monkeypatch.setattr("lerobot.configs.video.platform.system", lambda: "Darwin")
+        monkeypatch.setattr("lerobot.datasets.pyav_utils.bundled_svtav1_version", lambda: (3, 0, 0))
+        cfg = RGBEncoderConfig()
+        assert cfg.vcodec == "h264"
+        video_path = _encode_video(tmp_path / "out.mp4", cfg=cfg)
+        assert get_video_info(video_path)["video.codec"] == "h264"
+
+    @require_libsvtav1
+    def test_fixed_svtav1_stays_selected_on_darwin(self, monkeypatch):
+        monkeypatch.setattr("lerobot.configs.video._macos_svtav1_warned", False)
+        monkeypatch.setattr("lerobot.configs.video.platform.system", lambda: "Darwin")
+        monkeypatch.setattr("lerobot.datasets.pyav_utils.bundled_svtav1_version", lambda: (4, 3, 0))
+        cfg = RGBEncoderConfig()
+        assert cfg.vcodec == "libsvtav1"
+        assert cfg.preset == 12
 
 
 class TestGetVideoInfo:

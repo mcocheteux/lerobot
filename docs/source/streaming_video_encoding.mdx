@@ -96,7 +96,7 @@ Use HW encoding when:
 > In order to use the HW accelerated encoders you might need to upgrade your GPU drivers.
 
 > [!NOTE]
-> `libsvtav1` is the default because it provides the best training performance; other vcodecs can reduce CPU usage and be faster, but they typically produce larger files and may affect training time.
+> `libsvtav1` is the default because it provides the best training performance; other vcodecs can reduce CPU usage and be faster, but they typically produce larger files and may affect training time. On macOS, if the bundled SVT-AV1 is older than 4.3.0, LeRobot records with `h264` instead: closing `libsvtav1` can kill the process. See [Video encoding parameters](./video_encoding_parameters).
 
 ## 5. Troubleshooting
 
@@ -108,6 +108,7 @@ Use HW encoding when:
 | Large video files                                                  | Using HW encoder or H.264                    | Expected trade-off. Switch to `libsvtav1` if CPU allows                                                                                                                                                                                                                                          |
 | `save_episode()` still slow                                        | `streaming_encoding` is `False`              | Set `--dataset.streaming_encoding=true`                                                                                                                                                                                                                                                          |
 | Encoder thread crash                                               | Codec not available or invalid settings      | Check `vcodec` is installed, try `--dataset.rgb_encoder.vcodec=auto`                                                                                                                                                                                                                             |
+| Exit 133 or `trace trap`, no traceback                             | SVT-AV1 before 4.3.0 on macOS                | Affected builds record with `h264`. `LEROBOT_ALLOW_SVTAV1=1` keeps `libsvtav1` and can still be killed. See [Video encoding parameters](./video_encoding_parameters).                                                                                                                            |
 | Recorded dataset is missing frames                                 | CPU/GPU starvation or occasional load spikes | If ~5% of frames are missing, your system is likely overloaded — follow the recommendations above. If fewer frames are missing (~2%), they are probably due to occasional transient load spikes (often at startup) and can be considered expected.                                               |
 
 ## 6. Recommended Configurations
