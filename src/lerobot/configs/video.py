@@ -19,6 +19,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
+import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Self
 
@@ -45,6 +49,87 @@ VALID_VIDEO_CODECS: frozenset[str] = frozenset(
 VIDEO_CODECS_ALIASES: dict[str, str] = {"av1": "libsvtav1"}
 
 LIBSVTAV1_DEFAULT_PRESET: int = 12
+
+# SVT-AV1 before 4.3.0 can SIGTRAP on macOS when an encoder is destroyed.
+# libdispatch aborts if a semaphore is freed below its initial value
+# (AOMediaCodec/SVT-AV1#2961, fixed by 049193fc in 4.3.0). Linux and Windows
+# semaphores do not check, so the same library is safe there. Current PyAV
+# wheels still ship an affected SVT-AV1.
+SVTAV1_MACOS_SEMAPHORE_FIX: tuple[int, int, int] = (4, 3, 0)
+MACOS_SVTAV1_SAFE_ENCODER: str = "h264"
+LEROBOT_ALLOW_SVTAV1_ENV: str = "LEROBOT_ALLOW_SVTAV1"
+_SVTAV1_MACOS_ISSUE_URL: str = "https://github.com/huggingface/lerobot/issues/5308"
+_SVTAV1_VERSION_RE: re.Pattern[str] = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# Auditwheel hashes the SONAME (`libSvtAv1Enc-<hash>.so.3.0.0`). macOS wheels use
+# `libSvtAv1Enc.3.0.0.dylib`. A major-only SONAME (`libSvtAv1Enc.so.3`) does not match.
+_SVTAV1_LIBRARY_VERSION_RE: re.Pattern[str] = re.compile(
+    r"libSvtAv1Enc(?:-[0-9A-Fa-f]+)?(?:\.so)?\.(\d+)\.(\d+)\.(\d+)",
+    re.IGNORECASE,
+)
+# Reconstruction from a dataset's stored codec must not silently switch encoders.
+_APPLY_MACOS_SVTAV1_GUARD: ContextVar[bool] = ContextVar("lerobot_apply_macos_svtav1_guard", default=True)
+_macos_svtav1_warned: bool = False
+
+
+def _format_svtav1_version(version: tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def parse_svtav1_version(text: str) -> tuple[int, int, int] | None:
+    """Return the first ``major.minor.patch`` in *text*, or ``None``."""
+    match = _SVTAV1_VERSION_RE.search(text)
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def svtav1_version_from_library_name(name: str) -> tuple[int, int, int] | None:
+    """Read an SVT-AV1 version from a ``libSvtAv1Enc`` filename, if it has one.
+
+    PyAV's macOS wheel names the affected build ``libSvtAv1Enc.3.0.0.dylib``.
+    A SONAME with only the major version (``libSvtAv1Enc.so.3``) cannot be
+    classified and yields ``None``.
+    """
+    match = _SVTAV1_LIBRARY_VERSION_RE.search(name.replace("\\", "/"))
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def macos_svtav1_close_is_unsafe(version: tuple[int, ...] | None) -> bool:
+    """Whether *version* is a known SVT-AV1 that can SIGTRAP on encoder close.
+
+    ``None`` means the version could not be read. That is not treated as a
+    known-affected build.
+    """
+    if not version:
+        return False
+    parts = tuple(int(part) for part in version[:3])
+    padded = parts + (0,) * (3 - len(parts))
+    return padded < SVTAV1_MACOS_SEMAPHORE_FIX
+
+
+def _svtav1_explicitly_allowed() -> bool:
+    return os.environ.get(LEROBOT_ALLOW_SVTAV1_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _warn_macos_svtav1_once(message: str) -> None:
+    global _macos_svtav1_warned
+    if _macos_svtav1_warned:
+        return
+    _macos_svtav1_warned = True
+    logger.warning(message)
+
+
+def _bundled_svtav1_version() -> tuple[int, int, int] | None:
+    # Lazy: pyav_utils imports PyAV, an optional dataset extra. Importing it at
+    # module scope would make ``lerobot.configs`` require that extra.
+    from lerobot.datasets.pyav_utils import bundled_svtav1_version
+
+    return bundled_svtav1_version()
+
 
 # Keys persisted under ``features[*]["info"]`` as ``video.<name>`` (from :class:`VideoEncoderConfig`).
 # ``vcodec``` and ``pix_fmt`` are derived from the video stream directly.
@@ -86,7 +171,7 @@ DEPTH_ENCODER_INFO_FIELD_NAMES: frozenset[str] = frozenset({"depth_min", "depth_
 class VideoEncoderConfig:
     """Video encoder configuration."""
 
-    vcodec: str = "libsvtav1"  # Video codec name. "auto" picks a hardware codec if available, else libsvtav1.
+    vcodec: str = "libsvtav1"  # Video codec. "auto" picks a hardware codec if available, else libsvtav1. On macOS with SVT-AV1 < 4.3.0, libsvtav1 is replaced with h264.
     pix_fmt: str = "yuv420p"  # Pixel format (e.g. yuv420p).
     g: int | None = 2  # GOP size (keyframe interval).
     crf: int | float | None = 30  # Quality level. Lower means better quality and larger files.
@@ -138,9 +223,17 @@ class VideoEncoderConfig:
     def from_video_info(cls, video_info: dict | None) -> Self:
         """Reconstruct an encoder config from a video feature's ``info`` block.
 
-        Missing or ``None`` values fall back to the class defaults.
+        Missing or ``None`` values fall back to the class defaults. A codec
+        recorded in the block is kept, including ``libsvtav1`` on macOS, so
+        editing an existing dataset does not switch codecs.
         """
-        return cls(**cls._kwargs_from_video_info(video_info))
+        video_info = video_info or {}
+        codec_was_stored = video_info.get("video.codec") is not None
+        token = _APPLY_MACOS_SVTAV1_GUARD.set(not codec_was_stored)
+        try:
+            return cls(**cls._kwargs_from_video_info(video_info))
+        finally:
+            _APPLY_MACOS_SVTAV1_GUARD.reset(token)
 
     def detect_available_encoders(self, encoders: list[str] | str) -> list[str]:
         """Return the subset of available encoders based on the specified video backend.
@@ -170,15 +263,20 @@ class VideoEncoderConfig:
     def resolve_vcodec(self) -> None:
         """Check ``vcodec`` and, when it is ``"auto"``, pick a concrete encoder.
 
-        For ``"auto"``, the first hardware encoder in the preference list that is available is chosen; if none are available, ``libsvtav1`` is used. If the
-        resolved codec (explicit or after auto-selection) is not available, raises ``ValueError``.
+        For ``"auto"``, the first hardware encoder in the preference list that is
+        available is chosen. If none are available, ``libsvtav1`` is used. On
+        macOS, a ``libsvtav1`` choice whose bundled SVT-AV1 is older than 4.3.0
+        is replaced with ``h264``. If the resolved codec is not available,
+        raises ``ValueError``.
 
         Stream-derived canonical codec names listed in :data:`VIDEO_CODECS_ALIASES` are
         rewritten to their corresponding encoder name (e.g. ``"av1"`` → ``"libsvtav1"``).
+        Codecs read back from dataset metadata are not replaced.
         """
         self.vcodec = VIDEO_CODECS_ALIASES.get(self.vcodec, self.vcodec)
         if self.vcodec not in VALID_VIDEO_CODECS:
             raise ValueError(f"Invalid vcodec '{self.vcodec}'. Must be one of: {sorted(VALID_VIDEO_CODECS)}")
+        replaced = False
         if self.vcodec == "auto":
             available = self.detect_available_encoders(HW_VIDEO_CODECS)
             for encoder in HW_VIDEO_CODECS:
@@ -186,13 +284,86 @@ class VideoEncoderConfig:
                     logger.info(f"Auto-selected video codec: {encoder}")
                     self.vcodec = encoder
                     return
-            logger.warning("No hardware encoder available, falling back to software encoder 'libsvtav1'")
             self.vcodec = "libsvtav1"
+            if _APPLY_MACOS_SVTAV1_GUARD.get():
+                replaced = self._maybe_replace_macos_svtav1()
+            if not replaced:
+                logger.warning("No hardware encoder available, falling back to software encoder 'libsvtav1'")
+        elif _APPLY_MACOS_SVTAV1_GUARD.get():
+            self._maybe_replace_macos_svtav1()
+        else:
+            self._warn_if_stored_macos_svtav1_is_unsafe()
 
         if self.detect_available_encoders(self.vcodec):
             logger.info(f"Using video codec: {self.vcodec}")
             return
         raise ValueError(f"Unsupported video codec: {self.vcodec} with video backend {self.video_backend}")
+
+    def _maybe_replace_macos_svtav1(self) -> bool:
+        """Replace a known-bad macOS ``libsvtav1`` with software H.264.
+
+        Returns whether the codec was replaced. No-op off macOS, on SVT-AV1
+        4.3.0 or newer, when the version cannot be read, and when
+        ``LEROBOT_ALLOW_SVTAV1`` is set.
+        """
+        if self.vcodec != "libsvtav1" or platform.system() != "Darwin":
+            return False
+        version = _bundled_svtav1_version()
+        rendered = "an unknown version" if version is None else _format_svtav1_version(version)
+        if _svtav1_explicitly_allowed():
+            if version is None or macos_svtav1_close_is_unsafe(version):
+                _warn_macos_svtav1_once(
+                    f"{LEROBOT_ALLOW_SVTAV1_ENV} is set, so libsvtav1 stays selected on macOS. "
+                    f"SVT-AV1 {rendered} can abort the process with SIGTRAP when an encoder closes "
+                    f"({_SVTAV1_MACOS_ISSUE_URL})."
+                )
+            return False
+        if version is None:
+            _warn_macos_svtav1_once(
+                "Could not read the bundled SVT-AV1 version. On macOS, SVT-AV1 older than "
+                f"{_format_svtav1_version(SVTAV1_MACOS_SEMAPHORE_FIX)} can abort the process with "
+                "SIGTRAP when an encoder closes, so libsvtav1 stays selected. Pass "
+                f"vcodec={MACOS_SVTAV1_SAFE_ENCODER}, or install a build that bundles SVT-AV1 "
+                f"{_format_svtav1_version(SVTAV1_MACOS_SEMAPHORE_FIX)} or newer "
+                f"({_SVTAV1_MACOS_ISSUE_URL})."
+            )
+            return False
+        if not macos_svtav1_close_is_unsafe(version):
+            return False
+        if not self.detect_available_encoders(MACOS_SVTAV1_SAFE_ENCODER):
+            _warn_macos_svtav1_once(
+                f"libsvtav1 on macOS is linked to SVT-AV1 {rendered}, which can abort the process "
+                "with SIGTRAP when an encoder closes, and "
+                f"{MACOS_SVTAV1_SAFE_ENCODER} is not available to replace it "
+                f"({_SVTAV1_MACOS_ISSUE_URL})."
+            )
+            return False
+        if isinstance(self.preset, int) and not isinstance(self.preset, bool):
+            # SVT-AV1 presets are integers. x264 presets are names, and the integer
+            # would fail validation on the replacement encoder.
+            self.preset = None
+        self.vcodec = MACOS_SVTAV1_SAFE_ENCODER
+        _warn_macos_svtav1_once(
+            f"Using {MACOS_SVTAV1_SAFE_ENCODER} instead of libsvtav1 on macOS. The bundled SVT-AV1 "
+            f"{rendered} can abort the process with SIGTRAP (exit 133) when an encoder closes. "
+            f"SVT-AV1 {_format_svtav1_version(SVTAV1_MACOS_SEMAPHORE_FIX)} fixes that race. "
+            f"Set {LEROBOT_ALLOW_SVTAV1_ENV}=1 to keep libsvtav1 ({_SVTAV1_MACOS_ISSUE_URL})."
+        )
+        return True
+
+    def _warn_if_stored_macos_svtav1_is_unsafe(self) -> None:
+        """Warn when dataset metadata keeps ``libsvtav1`` on an affected macOS build."""
+        if self.vcodec != "libsvtav1" or platform.system() != "Darwin":
+            return
+        version = _bundled_svtav1_version()
+        if version is not None and not macos_svtav1_close_is_unsafe(version):
+            return
+        rendered = "an unknown version" if version is None else _format_svtav1_version(version)
+        _warn_macos_svtav1_once(
+            "This dataset video uses libsvtav1. On macOS the bundled SVT-AV1 "
+            f"{rendered} can abort the process with SIGTRAP if those videos are re-encoded. "
+            f"The stored codec is kept ({_SVTAV1_MACOS_ISSUE_URL})."
+        )
 
     def get_codec_options(
         self, encoder_threads: int | None = None, as_strings: bool = False
